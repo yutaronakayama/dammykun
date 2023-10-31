@@ -2,100 +2,116 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
 	"github.com/tmc/langchaingo/llms/openai"
 	"github.com/tmc/langchaingo/schema"
 )
 
-//TODO: completion用のテキストを作成する関数を用意する
-//TODO: どういう感じでfixtureのアウトプットをしたいか(適当にどのようなyamlが作成されるかいくつかパターンを用意する、次回のゴールを設定するイメージ)
-
-//1. casoneのデータベースを用意する必要がある→ダンプで最新のデータをとってくる必要がある
-//2. casoneのデータベースダンプファイルからテーブルの定義を取得する
-//3. 上で取得したテーブル名、生成個数をOpenAPIに投げる
-//4. numで定義した引数個数分のfixtureを生成して出力する（全カラム分）
-
-//detail: casoneのスタッフのテーブルを作成する
-// fixtureのデータは日本語文字列を含むことができる
-// カラムの値を指定できるようにする
-
 //課題: 全テーブルをschema.SystemChatMessageに投げるのは、無理そう？RateLimit?の関係
-//まだよくわかっていないが、欲しいテーブルだけなげるのが良さそう
+//前提として、全テーブル、全カラムについて定数の範囲やテーブル間のデータ構造を考慮するのは厳しいので
+//エラーがでているカラムに関してはよしなに使用者の方で修正してもらう
 
-const msg = `
-defined table users
+//定数問題：
+//存在しない定数が入っていたらNGなので、それらの値は1-3の間で出力する
 
-CREATE TABLE users (
-  uuid uuid NOT NULL,
-  name varchar(255) COLLATE utf8mb4_general_ci NOT NULL DEFAULT '',
-  email varchar(255) COLLATE utf8mb4_general_ci NOT NULL DEFAULT ''
-)
-`
+//外部キー
+//外部キーでの制約があるものに関しては、NULLの値を入れて出力する
 
-func readFile() (lines string, err error) {
-	b, err := ioutil.ReadFile("casone_lite_local_2023-09-08.sql")
+//他カラム依存：
+//全部考慮できないので、ロジック組むのは作業として重そうなので考慮しない方針でいく
+
+func connectLocalMysqlDB() (*sqlx.DB, error) {
+	dsn := "root:@tcp(localhost:3306)/casone_lite_local?parseTime=true"
+	db, err := sqlx.Open("mysql", dsn)
 	if err != nil {
-		fmt.Println(os.Stderr, err)
-		os.Exit(1)
+		log.Fatalf("failed to connect to the MySQL database: %v", err)
 	}
-	lines = string(b)
-	return lines, err
+	return db, nil
 }
 
-func writeFile(lines *schema.AIChatMessage, filePath string) (err error) {
-	f, err := os.Open(filePath)
-	data := []byte(lines.Content)
-	_, err = f.Write(data)
+func showSchemaInfo(db *sqlx.DB, table *string) (string, error) {
+	rows, err := db.Query(fmt.Sprintf("show create table %s", *table))
+	if err != nil {
+		log.Fatalf("failed to show columns from the MySQL database: %v", err)
+		return "", err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var a, b string
+		if err := rows.Scan(&a, &b); err != nil {
+			panic(err)
+		}
+		return b, nil
+	}
+
+	return "", errors.New("not found")
+}
+
+func writeOnYamlFile(fileName string, data string) error {
+	f, err := os.Create(fileName)
+	_, err = f.Write([]byte(data))
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func connectLocalMysqlDB() (*sqlx.DB, error) {
-	dsn := "root:@tcp(localhost:3306)/otelsql?parseTime=true"
-	db, err := sqlx.Open("mysql", dsn)
-	if err != nil {
-		log.Fatalf("failed to connect to the MySQL database: %v", err)
-	}
-	defer db.Close()
-	return db, nil
-}
-
 func main() {
 	// フラグを用意する
 	table := flag.String("table", "staffs", "string flag")
 	num := flag.Int("n", 10, "int flag")
-	//fill := flag.String("fill", "", "string flag")
-	//language := flag.String("lang", "", "string flag")
-
-	//file作成のフラグを用意する
+	fileOutput := flag.String("file", "sample", "string flag")
 	flag.Parse()
 
-	//ファイル情報を読み込む
-	sqlLines, err := readFile()
+	llm, err := openai.NewChat(openai.WithModel("gpt-3.5-turbo-16k"))
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	llm, err := openai.NewChat()
+	fmt.Println("db-debug")
+	db, err := connectLocalMysqlDB()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	schemaInfo, err := showSchemaInfo(db, table)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	ctx := context.Background()
-	content := "Please generate " + string(*num) + " fixtures for the " + *table + " table in .yaml format without the model name."
+	content := fmt.Sprintf(
+		`Please generate " + %d + " fixtures for the " + %s + "table in .yaml format with id and filled fields without the model name.
+		and branch_id, tenant_id is between 1 and 3,
+		and time columns is in timedate type,
+		and value is based on japanese,
+		and if there is a foreign key constraint, set the value to null,
+		and id columns are between 1 value.
+		`, *num, *table)
+
+	fmt.Println("call-chatgpt-debug")
 	completion, err := llm.Call(ctx, []schema.ChatMessage{
-		schema.SystemChatMessage{Content: sqlLines},
+		schema.SystemChatMessage{Content: schemaInfo},
 		schema.HumanChatMessage{Content: content},
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Println(completion)
-	writeFile(completion, "output.yaml")
+	//ファイル出力
+	if *fileOutput != "" {
+		err := writeOnYamlFile(*fileOutput+".yaml", completion.GetContent())
+		if err != nil {
+			fmt.Println(err)
+		}
+	}
 }
