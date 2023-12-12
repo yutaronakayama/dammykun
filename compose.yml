@@ -1,0 +1,11 @@
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: yes
+      MYSQL_DATABASE: dammykun
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./_sql:/docker-entrypoint-initdb.d
+      - ./my.cnf:/etc/mysql/conf.d/my.cnf
